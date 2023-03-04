@@ -53,6 +53,8 @@ func isCloseable(err error) bool {
 
 // Proxy is an HTTP proxy with support for TLS MITM and customizable behavior.
 type Proxy struct {
+	TLSPassthroughFunc func(req *http.Request) bool // Callback function to skip mitm
+	// internal or not exported fields
 	roundTripper http.RoundTripper
 	dial         func(string, string) (net.Conn, error)
 	timeout      time.Duration
@@ -292,6 +294,17 @@ func (p *Proxy) readRequest(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) 
 		return nil, errClose
 	}
 
+	// Setup a Reusable request body
+	var tempBody io.ReadCloser = nil
+	if req.ContentLength > 0 {
+		bin, err := io.ReadAll(req.Body)
+		if err == nil {
+			tempBody = io.NopCloser(bytes.NewReader(bin))
+		}
+	}
+	if tempBody != nil {
+		req.Body = tempBody
+	}
 	return req, nil
 }
 
@@ -305,7 +318,18 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		return nil
 	}
 
+	SetupMitm := false
+	// check if proxy should setup mitm for this connection
 	if p.mitm != nil {
+		SetupMitm = true
+	}
+
+	if p.TLSPassthroughFunc != nil {
+		SetupMitm = !p.TLSPassthroughFunc(req)
+	}
+
+	// Setup Mitm Connection
+	if SetupMitm {
 		log.Debugf("martian: attempting MITM for connection: %s / %s", req.Host, req.URL.String())
 
 		res := proxyutil.NewResponse(200, nil, req)
@@ -461,7 +485,7 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	if tsconn, ok := conn.(*trafficshape.Conn); ok {
 		wrconn := tsconn.GetWrappedConn()
 		if sconn, ok := wrconn.(*tls.Conn); ok {
-			session.MarkSecure()
+			// session.MarkSecure()
 
 			cs := sconn.ConnectionState()
 			req.TLS = &cs
@@ -469,17 +493,18 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	}
 
 	if tconn, ok := conn.(*tls.Conn); ok {
-		session.MarkSecure()
+		// session.MarkSecure()
 
 		cs := tconn.ConnectionState()
 		req.TLS = &cs
 	}
 
-	req.URL.Scheme = "http"
-	if session.IsSecure() {
-		log.Infof("martian: forcing HTTPS inside secure session")
-		req.URL.Scheme = "https"
-	}
+	// do not alter scheme
+	// req.URL.Scheme = "http"
+	// if session.IsSecure() {
+	// 	log.Infof("martian: forcing HTTPS inside secure session")
+	// 	req.URL.Scheme = "https"
+	// }
 
 	req.RemoteAddr = conn.RemoteAddr().String()
 	if req.URL.Host == "" {

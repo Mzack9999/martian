@@ -17,7 +17,7 @@ package martian
 import (
 	"bufio"
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"testing"
@@ -127,7 +127,7 @@ func TestContextHijack(t *testing.T) {
 		conn.Close()
 	}()
 
-	got, err := ioutil.ReadAll(wc)
+	got, err := io.ReadAll(wc)
 	if err != nil {
 		t.Fatalf("ioutil.ReadAll(): got %v, want no error", err)
 	}
