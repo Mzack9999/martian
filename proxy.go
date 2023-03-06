@@ -19,12 +19,14 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
+	syslog "log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
-	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +41,13 @@ var errClose = errors.New("closing connection")
 var noop = Noop("martian")
 
 func isCloseable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// if error is a EOF error close connection
+	if strings.Contains(err.Error(), "EOF") {
+		return true
+	}
 	if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 		return true
 	}
@@ -47,7 +56,6 @@ func isCloseable(err error) bool {
 	case io.EOF, io.ErrClosedPipe, errClose:
 		return true
 	}
-
 	return false
 }
 
@@ -224,19 +232,20 @@ func (p *Proxy) Serve(l net.Listener) error {
 
 		if tconn, ok := conn.(*net.TCPConn); ok {
 			tconn.SetKeepAlive(true)
-			tconn.SetKeepAlivePeriod(3 * time.Minute)
+			tconn.SetKeepAlivePeriod(3 * time.Second)
 		}
-
+		// clients create new connection to proxy server
+		// everytime request is sent to different connection
+		p.conns.Add(1)
 		go p.handleLoop(conn)
 	}
 }
 
 func (p *Proxy) handleLoop(conn net.Conn) {
-	p.connsMu.Lock()
-	p.conns.Add(1)
-	p.connsMu.Unlock()
+	// p.connsMu.Lock()
+	// p.conns.Add(1)
+	// p.connsMu.Unlock()
 	defer p.conns.Done()
-	defer conn.Close()
 	if p.Closing() {
 		return
 	}
@@ -260,7 +269,10 @@ func (p *Proxy) handleLoop(conn net.Conn) {
 		conn.SetDeadline(deadline)
 
 		if err := p.handle(ctx, conn, brw); isCloseable(err) {
-			log.Debugf("martian: closing connection: %v", conn.RemoteAddr())
+			syslog.Printf("martian: closing connection: %v", conn.RemoteAddr())
+			if err := conn.Close(); err != nil {
+				syslog.Printf("got %v while closing connection", err)
+			}
 			return
 		}
 	}
@@ -271,9 +283,26 @@ func (p *Proxy) readRequest(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) 
 	reqc := make(chan *http.Request, 1)
 	errc := make(chan error, 1)
 	go func() {
-		r, err := http.ReadRequest(brw.Reader)
+		var buff bytes.Buffer
+		tmpreader := bufio.NewReader(io.TeeReader(brw.Reader, &buff))
+		r, err := http.ReadRequest(tmpreader)
+		if r != nil {
+			ctx.lastreq = r
+		}
 		if err != nil {
-			errc <- err
+			// syslog.Printf("closing connection")
+			// if tconn, ok := conn.(*net.TCPConn); ok {
+			// 	if err := tconn.Close(); err != nil {
+			// 		syslog.Printf("got %v while closing connection", err)
+			// 	}
+			// }
+			if urlerr, ok := err.(*url.Error); ok {
+				syslog.Printf("got url error while parsing request %v\n", urlerr)
+			}
+			syslog.Printf("\n-------------\nlast successful parsed req and resp before error was\n`%v`\n`%v`\n", ctx.lastreq, ctx.lastresp)
+			xyz := fmt.Sprintf("got `%v` data read from raw conn %v", err, strconv.Quote(buff.String()))
+			syslog.Print(xyz)
+			errc <- fmt.Errorf(xyz)
 			return
 		}
 		reqc <- r
@@ -330,31 +359,31 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 
 	// Setup Mitm Connection
 	if SetupMitm {
-		log.Debugf("martian: attempting MITM for connection: %s / %s", req.Host, req.URL.String())
+		log.Debugf("martian mitm: attempting MITM for connection: %s / %s", req.Host, req.URL.String())
 
 		res := proxyutil.NewResponse(200, nil, req)
 
 		if err := p.resmod.ModifyResponse(res); err != nil {
-			log.Errorf("martian: error modifying CONNECT response: %v", err)
+			log.Errorf("martian mitm: error modifying CONNECT response: %v", err)
 			proxyutil.Warning(res.Header, err)
 		}
 		if session.Hijacked() {
-			log.Infof("martian: connection hijacked by response modifier")
+			log.Infof("martian mitm: connection hijacked by response modifier")
 			return nil
 		}
 
 		if err := res.Write(brw); err != nil {
-			log.Errorf("martian: got error while writing response back to client: %v", err)
+			log.Errorf("martian mitm: got error for %v while writing response back to client: %v", req.Host, err)
 		}
 		if err := brw.Flush(); err != nil {
-			log.Errorf("martian: got error while flushing response back to client: %v", err)
+			log.Errorf("martian mitm: got error for %v while flushing response back to client: %v", req.Host, err)
 		}
 
-		log.Debugf("martian: completed MITM for connection: %s", req.Host)
+		log.Debugf("martian mitm: completed MITM for connection: %s", req.Host)
 
 		b := make([]byte, 1)
 		if _, err := brw.Read(b); err != nil {
-			log.Errorf("martian: error peeking message through CONNECT tunnel to determine type: %v", err)
+			log.Errorf("martian mitm: error peeking message through CONNECT tunnel to determine type %v : %v", req.Host, err)
 		}
 
 		// Drain all of the rest of the buffered data.
@@ -363,6 +392,8 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 
 		// 22 is the TLS handshake.
 		// https://tools.ietf.org/html/rfc5246#section-6.2.1
+		//   change_cipher_spec(20), alert(21), handshake(22),
+		// application_data(23), (255)
 		if b[0] == 22 {
 			// Prepend the previously read data to be read again by
 			// http.ReadRequest.
@@ -386,8 +417,11 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 			brw.Writer.Reset(nconn)
 			brw.Reader.Reset(nconn)
 			return p.handle(ctx, nconn, brw)
+		} else {
+			syslog.Printf("fragment values is %v\n", b[0])
 		}
 
+		syslog.Printf("got connect request but not a tls handshake")
 		// Prepend the previously read data to be read again by http.ReadRequest.
 		brw.Reader.Reset(io.MultiReader(bytes.NewReader(b), bytes.NewReader(buf), conn))
 		return p.handle(ctx, conn, brw)
@@ -410,11 +444,11 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 		}
 
 		if err := res.Write(brw); err != nil {
-			log.Errorf("martian: got error while writing response back to client: %v", err)
+			log.Errorf("martian: got error for %v while writing response back to client: %v", req.Host, err)
 		}
 		err := brw.Flush()
 		if err != nil {
-			log.Errorf("martian: got error while flushing response back to client: %v", err)
+			log.Errorf("martian: got error for %v while flushing response back to client: %v", req.Host, err)
 		}
 		return err
 	}
@@ -432,19 +466,19 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 
 	res.ContentLength = -1
 	if err := res.Write(brw); err != nil {
-		log.Errorf("martian: got error while writing response back to client: %v", err)
+		log.Errorf("martian: got error for %v while writing response back to client: %v", req.Host, err)
 	}
 	if err := brw.Flush(); err != nil {
-		log.Errorf("martian: got error while flushing response back to client: %v", err)
+		log.Errorf("martian: got error for %v while flushing response back to client: %v", req.Host, err)
 	}
 
 	cbw := bufio.NewWriter(cconn)
 	cbr := bufio.NewReader(cconn)
 	defer cbw.Flush()
 
-	copySync := func(w io.Writer, r io.Reader, donec chan<- bool) {
+	copySync := func(w io.Writer, r io.Reader, donec chan<- bool, hostname string) {
 		if _, err := io.Copy(w, r); err != nil && err != io.EOF {
-			log.Errorf("martian: failed to copy CONNECT tunnel: %v", err)
+			log.Errorf("martian: failed to copy CONNECT tunnel for %v: %v", hostname, err)
 		}
 
 		log.Debugf("martian: CONNECT tunnel finished copying")
@@ -452,8 +486,8 @@ func (p *Proxy) handleConnectRequest(ctx *Context, req *http.Request, session *S
 	}
 
 	donec := make(chan bool, 2)
-	go copySync(cbw, brw, donec)
-	go copySync(brw, cbr, donec)
+	go copySync(cbw, brw, donec, req.Host)
+	go copySync(brw, cbr, donec, req.Host)
 
 	log.Debugf("martian: established CONNECT tunnel, proxying traffic")
 	<-donec
@@ -482,15 +516,15 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 	link(req, ctx)
 	defer unlink(req)
 
-	if tsconn, ok := conn.(*trafficshape.Conn); ok {
-		wrconn := tsconn.GetWrappedConn()
-		if sconn, ok := wrconn.(*tls.Conn); ok {
-			// session.MarkSecure()
+	// if tsconn, ok := conn.(*trafficshape.Conn); ok {
+	// 	wrconn := tsconn.GetWrappedConn()
+	// 	if sconn, ok := wrconn.(*tls.Conn); ok {
+	// 		// session.MarkSecure()
 
-			cs := sconn.ConnectionState()
-			req.TLS = &cs
-		}
-	}
+	// 		cs := sconn.ConnectionState()
+	// 		req.TLS = &cs
+	// 	}
+	// }
 
 	if tconn, ok := conn.(*tls.Conn); ok {
 		// session.MarkSecure()
@@ -499,6 +533,10 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		req.TLS = &cs
 	}
 
+	if req.URL.Scheme == "" {
+		// upgrade to https by default
+		req.URL.Scheme = "https"
+	}
 	// do not alter scheme
 	// req.URL.Scheme = "http"
 	// if session.IsSecure() {
@@ -520,9 +558,9 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		log.Errorf("martian: error modifying request: %v", err)
 		proxyutil.Warning(req.Header, err)
 	}
-	if session.Hijacked() {
-		return nil
-	}
+	// if session.Hijacked() {
+	// 	return nil
+	// }
 
 	// perform the HTTP roundtrip
 	res, err := p.roundTrip(ctx, req)
@@ -530,12 +568,16 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		log.Errorf("martian: failed to round trip: %v", err)
 		res = proxyutil.NewResponse(502, nil, req)
 		proxyutil.Warning(res.Header, err)
+		return err
 	}
+	ctx.lastresp = res
 	defer res.Body.Close()
 
 	// set request to original request manually, res.Request may be changed in transport.
 	// see https://github.com/google/martian/issues/298
 	res.Request = req
+	// respdump, _ := httputil.DumpResponse(res, false)
+	// syslog.Printf("\n------\n%v\n", string(respdump))
 
 	if err := p.resmod.ModifyResponse(res); err != nil {
 		log.Errorf("martian: error modifying response: %v", err)
@@ -553,55 +595,57 @@ func (p *Proxy) handle(ctx *Context, conn net.Conn, brw *bufio.ReadWriter) error
 		closing = errClose
 	}
 
-	// check if conn is a traffic shaped connection.
-	if ptsconn, ok := conn.(*trafficshape.Conn); ok {
-		ptsconn.Context = &trafficshape.Context{}
-		// Check if the request URL matches any URLRegex in Shapes. If so, set the connections's Context
-		// with the required information, so that the Write() method of the Conn has access to it.
-		for urlregex, buckets := range ptsconn.LocalBuckets {
-			if match, _ := regexp.MatchString(urlregex, req.URL.String()); match {
-				if rangeStart := proxyutil.GetRangeStart(res); rangeStart > -1 {
-					dump, err := httputil.DumpResponse(res, false)
-					if err != nil {
-						return err
-					}
-					ptsconn.Context = &trafficshape.Context{
-						Shaping:            true,
-						Buckets:            buckets,
-						GlobalBucket:       ptsconn.GlobalBuckets[urlregex],
-						URLRegex:           urlregex,
-						RangeStart:         rangeStart,
-						ByteOffset:         rangeStart,
-						HeaderLen:          int64(len(dump)),
-						HeaderBytesWritten: 0,
-					}
-					// Get the next action to perform, if there.
-					ptsconn.Context.NextActionInfo = ptsconn.GetNextActionFromByte(rangeStart)
-					// Check if response lies in a throttled byte range.
-					ptsconn.Context.ThrottleContext = ptsconn.GetCurrentThrottle(rangeStart)
-					if ptsconn.Context.ThrottleContext.ThrottleNow {
-						ptsconn.Context.Buckets.WriteBucket.SetCapacity(
-							ptsconn.Context.ThrottleContext.Bandwidth)
-					}
-					log.Infof(
-						"trafficshape: Request %s with Range Start: %d matches a Shaping request %s. Enforcing Traffic shaping.",
-						req.URL, rangeStart, urlregex)
-				}
-				break
-			}
-		}
-	}
-
+	// // check if conn is a traffic shaped connection.
+	// if ptsconn, ok := conn.(*trafficshape.Conn); ok {
+	// 	ptsconn.Context = &trafficshape.Context{}
+	// 	// Check if the request URL matches any URLRegex in Shapes. If so, set the connections's Context
+	// 	// with the required information, so that the Write() method of the Conn has access to it.
+	// 	for urlregex, buckets := range ptsconn.LocalBuckets {
+	// 		if match, _ := regexp.MatchString(urlregex, req.URL.String()); match {
+	// 			if rangeStart := proxyutil.GetRangeStart(res); rangeStart > -1 {
+	// 				dump, err := httputil.DumpResponse(res, false)
+	// 				if err != nil {
+	// 					return err
+	// 				}
+	// 				ptsconn.Context = &trafficshape.Context{
+	// 					Shaping:            true,
+	// 					Buckets:            buckets,
+	// 					GlobalBucket:       ptsconn.GlobalBuckets[urlregex],
+	// 					URLRegex:           urlregex,
+	// 					RangeStart:         rangeStart,
+	// 					ByteOffset:         rangeStart,
+	// 					HeaderLen:          int64(len(dump)),
+	// 					HeaderBytesWritten: 0,
+	// 				}
+	// 				// Get the next action to perform, if there.
+	// 				ptsconn.Context.NextActionInfo = ptsconn.GetNextActionFromByte(rangeStart)
+	// 				// Check if response lies in a throttled byte range.
+	// 				ptsconn.Context.ThrottleContext = ptsconn.GetCurrentThrottle(rangeStart)
+	// 				if ptsconn.Context.ThrottleContext.ThrottleNow {
+	// 					ptsconn.Context.Buckets.WriteBucket.SetCapacity(
+	// 						ptsconn.Context.ThrottleContext.Bandwidth)
+	// 				}
+	// 				log.Infof(
+	// 					"trafficshape: Request %s with Range Start: %d matches a Shaping request %s. Enforcing Traffic shaping.",
+	// 					req.URL, rangeStart, urlregex)
+	// 			}
+	// 			break
+	// 		}
+	// 	}
+	// }
+	// if ctx.closenow {
+	// 	res.Write()
+	// }
 	err = res.Write(brw)
 	if err != nil {
-		log.Errorf("martian: got error while writing response back to client: %v", err)
+		log.Errorf("martian: got error for %v while writing response back to client: %v", req.Host, err)
 		if _, ok := err.(*trafficshape.ErrForceClose); ok {
 			closing = errClose
 		}
 	}
 	err = brw.Flush()
 	if err != nil {
-		log.Errorf("martian: got error while flushing response back to client: %v", err)
+		log.Errorf("martian: got error for %v while flushing response back to client: %v", req.Host, err)
 		if _, ok := err.(*trafficshape.ErrForceClose); ok {
 			closing = errClose
 		}
